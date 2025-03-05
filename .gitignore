@@ -15,6 +15,7 @@ venv/
 *.bin
 *.pth
 *.m
+*.sh
 
 *.o
 *.a

@@ -11,9 +11,16 @@ from torch.amp import GradScaler, autocast
 
 # 定义训练参数
 num_epochs = 10
-batch_size = 128
+batch_size = 256
 learning_rate = 0.001
 num_workers = 16
+data_address = os.getenv('DATASET_ADDRESS')
+if data_address:
+    # 使用数据集地址进行操作
+    print(f"Using dataset address: {data_address}")
+else:
+    print("Dataset address not set.")
+
 
 # 数据预处理
 train_transform = transforms.Compose(
@@ -38,10 +45,10 @@ val_transform = transforms.Compose(
 
 # 加载数据集
 train_dataset = datasets.ImageNet(
-    root="~/datasets/imagenet/", split="train", transform=train_transform
+    root=data_address, split="train", transform=train_transform
 )
 val_dataset = datasets.ImageNet(
-    root="~/datasets/imagenet/", split="val", transform=val_transform
+    root=data_address, split="val", transform=val_transform
 )
 
 train_loader = DataLoader(
@@ -58,7 +65,7 @@ if num_gpus > 1:
     print(f"Using {num_gpus} GPUs for training.")
 
 # 加载ResNet-18模型
-model = models.resnet18(pretrained=False)
+model = models.resnet18(weights=None)
 num_ftrs = model.fc.in_features
 model.fc = nn.Linear(num_ftrs, 1000)  # ImageNet有1000个类别
 
