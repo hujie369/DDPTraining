@@ -285,11 +285,7 @@ class Trainer:
 
     def get_optimizer(self, args, model):
         # 一些默认参数
-<<<<<<< HEAD
         base_batch_size = 256
-=======
-        base_batch_size = 128
->>>>>>> d141a88 (build the initial framework based on YOLOv6)
         weight_decay = 1e-4
         momentum = 0.9
 
@@ -298,11 +294,7 @@ class Trainer:
         accumulate = max(1, round(base_batch_size / args.batch_size))
         weight_decay *= args.batch_size * accumulate / base_batch_size
         # 根据实时的batch size对lr0进行缩放
-<<<<<<< HEAD
         lr0 = args.lr0 * (args.batch_size / base_batch_size)
-=======
-        lr0 = args.lr0 * base_batch_size / args.batch_size
->>>>>>> d141a88 (build the initial framework based on YOLOv6)
 
         # 单独对非bn的weight施加正则化
         g_bnw, g_w, g_b = [], [], []
