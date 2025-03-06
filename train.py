@@ -1,203 +1,133 @@
+#!/usr/bin/env python3
+# -*- coding:utf-8 -*-
+import argparse
+from logging import Logger
 import os
-from tqdm import tqdm
+import yaml
+import os.path as osp
+from pathlib import Path
+import sys
+import datetime
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
-from torch.amp import GradScaler, autocast
+import torch.distributed as dist
+
+from utils.general import find_latest_checkpoint, increment_name
+from utils.events import LOGGER, save_yaml
+from utils.envs import get_envs, select_device, set_random_seed
+from core.engine import Trainer
 
 
-# 定义训练参数
-num_epochs = 10
-batch_size = 256
-learning_rate = 0.001
-num_workers = 16
-data_address = os.getenv('DATASET_ADDRESS')
-if data_address:
-    # 使用数据集地址进行操作
-    print(f"Using dataset address: {data_address}")
-else:
-    print("Dataset address not set.")
+ROOT = os.getcwd()
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
 
-# 数据预处理
-train_transform = transforms.Compose(
-    [
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
-                             0.229, 0.224, 0.225]),
-    ]
-)
-
-val_transform = transforms.Compose(
-    [
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
-                             0.229, 0.224, 0.225]),
-    ]
-)
-
-# 加载数据集
-train_dataset = datasets.ImageNet(
-    root=data_address, split="train", transform=train_transform
-)
-val_dataset = datasets.ImageNet(
-    root=data_address, split="val", transform=val_transform
-)
-
-train_loader = DataLoader(
-    train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
-)
-val_loader = DataLoader(
-    val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
-)
-
-# 检测可用的GPU数量
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_gpus = torch.cuda.device_count()
-if num_gpus > 1:
-    print(f"Using {num_gpus} GPUs for training.")
-
-# 加载ResNet-18模型
-model = models.resnet18(weights=None)
-num_ftrs = model.fc.in_features
-model.fc = nn.Linear(num_ftrs, 1000)  # ImageNet有1000个类别
-
-if num_gpus > 1:
-    model = nn.DataParallel(model)
-
-model = model.to(device)
-
-# 定义损失函数和优化器
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-# 初始化GradScaler用于AMP训练
-scaler = GradScaler()
+def get_args_parser(add_help=True):
+    parser = argparse.ArgumentParser(
+        description='Pytorch Training', add_help=add_help)
+    parser.add_argument('--data-path', default='./data/imagenet',
+                        type=str, help='path of dataset')
+    parser.add_argument('--dataset', default='imagenet',
+                        type=str, help='the name of dataset, including imagenet, cifar10, cifar100')
+    parser.add_argument('--model', default='resnet18',
+                        type=str, help='the name of model')
+    parser.add_argument('--batch-size', default=128, type=int,
+                        help='total batch size for all GPUs')
+    parser.add_argument('--epochs', default=90, type=int,
+                        help='number of total epochs to run')
+    parser.add_argument('--lr0', default=0.1, type=float,
+                        help='the initial learning rate')
+    parser.add_argument('--milestones', default='30,60,80', type=str,
+                        help='number of epochs for learning rate decay (default: 30,60,80)')
+    parser.add_argument('--workers', default=16, type=int,
+                        help='number of data loading workers (default: 16)')
+    parser.add_argument('--device', default='0', type=str,
+                        help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--eval-interval', default=1,
+                        type=int, help='evaluate at every interval epochs')
+    parser.add_argument('--output-dir', default='./runs/train',
+                        type=str, help='path to save outputs')
+    parser.add_argument('--name', default='exp', type=str,
+                        help='experiment name, saved to output_dir/name')
+    parser.add_argument('--dist_url', default='env://', type=str,
+                        help='url used to set up distributed training')
+    parser.add_argument('--gpu_count', type=int, default=0)
+    parser.add_argument('--local_rank', type=int,
+                        default=-1, help='DDP parameter')
+    parser.add_argument('--resume', nargs='?', const=True,
+                        default=False, help='resume the most recent training')
+    return parser
 
 
-# 定义top1和top5准确率计算函数
-def accuracy(output, target, topk=(1,)):
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
+def check_and_init(args):
+    '''check config files and device.'''
+    # check files
+    master_process = args.rank == 0 if args.world_size > 1 else args.rank == -1
+    if args.resume:
+        # args.resume can be a checkpoint file path or a boolean value.
+        checkpoint_path = args.resume if isinstance(
+            args.resume, str) else find_latest_checkpoint()
+        assert os.path.isfile(
+            checkpoint_path), f'the checkpoint path is not exist: {checkpoint_path}'
+        LOGGER.info(
+            f'Resume training from the checkpoint file :{checkpoint_path}')
+        resume_opt_file_path = Path(
+            checkpoint_path).parent.parent / 'args.yaml'
+        if osp.exists(resume_opt_file_path):
+            with open(resume_opt_file_path) as f:
+                # load args value from args.yaml
+                args = argparse.Namespace(**yaml.safe_load(f))
+        else:
+            LOGGER.warning(f'We can not find the path of {Path(checkpoint_path).parent.parent / "args.yaml"},'
+                           f' we will save exp log to {Path(checkpoint_path).parent.parent}')
+            LOGGER.warning(
+                f'In this case, make sure to provide configuration, such as data, batch size.')
+            args.save_dir = str(Path(checkpoint_path).parent.parent)
+        # set the args.resume to checkpoint path.
+        args.resume = checkpoint_path
+    else:
+        args.save_dir = str(increment_name(
+            osp.join(args.output_dir, args.name)))
+        if master_process:
+            os.makedirs(args.save_dir)
 
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
+    # check device
+    device = select_device(args.device)
+    # set random seed
+    set_random_seed(1+args.rank, deterministic=(args.rank == -1))
+    # save args
+    if master_process:
+        save_yaml(vars(args), osp.join(args.save_dir, 'args.yaml'))
 
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
+    return device, args
 
 
-# 训练和验证循环
-best_top1 = 0
-checkpoint_dir = "checkpoints"
-os.makedirs(checkpoint_dir, exist_ok=True)
-checkpoint_files = []
+def main(args):
+    '''main function of training'''
+    # Setup
+    args.local_rank, args.rank, args.world_size = get_envs()
+    device, args = check_and_init(args)
+    # reload envs because args was chagned in check_and_init(args)
+    args.local_rank, args.rank, args.world_size = get_envs()
+    LOGGER.info(f'training args are: {args}\n')
+    if args.local_rank != -1:  # if DDP mode
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device('cuda', args.local_rank)
+        LOGGER.info('Initializing process group... ')
+        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo",
+                                init_method=args.dist_url, rank=args.local_rank, world_size=args.world_size, timeout=datetime.timedelta(seconds=7200))
 
-for epoch in range(num_epochs):
-    # 训练阶段
-    model.train()
-    train_loss = 0
-    train_top1 = 0
-    train_top5 = 0
-    num_batches = len(train_loader)
+    # Start
+    trainer = Trainer(args, device)
+    trainer.train()
 
-    with tqdm(
-        train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]", unit="batch"
-    ) as pbar:
-        for i, (images, labels) in enumerate(pbar):
-            images = images.to(device)
-            labels = labels.to(device)
+    # End
+    if args.world_size > 1 and args.rank == 0:
+        LOGGER.info('Destroying process group... ')
+        dist.destroy_process_group()
 
-            # 前向传播
-            with autocast("cuda"):
-                outputs = model(images)
-                loss = criterion(outputs, labels)
 
-            # 反向传播和优化
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            train_loss += loss.item()
-            top1, top5 = accuracy(outputs, labels, topk=(1, 5))
-            train_top1 += top1.item()
-            train_top5 += top5.item()
-
-    train_loss /= num_batches
-    train_top1 /= num_batches
-    train_top5 /= num_batches
-
-    print(
-        f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, "
-        f"Train Top1: {train_top1:.2f}%, Train Top5: {train_top5:.2f}%"
-    )
-
-    # 验证阶段
-    model.eval()
-    val_loss = 0
-    val_top1 = 0
-    val_top5 = 0
-    num_batches = len(val_loader)
-
-    with tqdm(
-        val_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Val]", unit="batch"
-    ) as pbar:
-        with torch.no_grad():
-            for images, labels in pbar:
-                images = images.to(device)
-                labels = labels.to(device)
-
-                with autocast():
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-
-                val_loss += loss.item()
-                top1, top5 = accuracy(outputs, labels, topk=(1, 5))
-                val_top1 += top1.item()
-                val_top5 += top5.item()
-
-    val_loss /= num_batches
-    val_top1 /= num_batches
-    val_top5 /= num_batches
-
-    print(
-        f"Epoch [{epoch+1}/{num_epochs}], Val Loss: {val_loss:.4f}, "
-        f"Val Top1: {val_top1:.2f}%, Val Top5: {val_top5:.2f}%"
-    )
-
-    # 保存检查点
-    checkpoint = {
-        "epoch": epoch + 1,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "val_top1": val_top1,
-    }
-    checkpoint_path = os.path.join(
-        checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth")
-    torch.save(checkpoint, checkpoint_path)
-    checkpoint_files.append(checkpoint_path)
-
-    if len(checkpoint_files) > 3:
-        oldest_checkpoint = checkpoint_files.pop(0)
-        os.remove(oldest_checkpoint)
-
-    # 保存全局最优模型
-    if val_top1 > best_top1:
-        best_top1 = val_top1
-        best_checkpoint_path = os.path.join(
-            checkpoint_dir, "best_checkpoint.pth")
-        torch.save(checkpoint, best_checkpoint_path)
-        print(f"Saved best model with Top1 accuracy: {best_top1:.2f}%")
+if __name__ == '__main__':
+    args = get_args_parser().parse_args()
+    main(args)

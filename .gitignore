@@ -4,6 +4,8 @@
 .DS_Store
 Thumbs.db
 
+data/
+runs/
 __pycache__/
 *.pyc
 *.pyo
