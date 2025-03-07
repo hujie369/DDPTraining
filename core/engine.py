@@ -23,6 +23,9 @@ from utils.checkpoint import save_checkpoint
 
 class Trainer:
     def __init__(self, args, device):
+        self.warmup_steps = 2000
+        self.warmup_factor = 0.1
+
         self.args = args
         self.device = device
         self.max_epoch = args.epochs
@@ -81,13 +84,25 @@ class Trainer:
     def train_one_epoch(self, epoch_num):
         try:
             for self.step, self.batch_data in self.pbar:
+                self.before_step()
                 self.train_in_steps(epoch_num, self.step)
                 self.print_details()
         except Exception as _:
             LOGGER.error('ERROR in training steps.')
             raise
 
+    def before_step(self):
+        """
+        warmup, 1000 bs
+        """
+        if self.epoch == 0 and self.step <= self.warmup_steps:
+            lrs = self.lr0 * self.warmup_factor
+            lrc = lrs + (self.lr0 - lrs) * self.step / self.warmup_steps
+            for params in self.optimizer.param_groups:
+                params['lr'] = lrc
+
     # Training one batch data.
+
     def train_in_steps(self, epoch_num, step_num):
         images = self.batch_data[0].to(self.device, non_blocking=True)
         labels = self.batch_data[1].to(self.device)
@@ -170,12 +185,7 @@ class Trainer:
                     images = images.to(self.device, non_blocking=True)
                     labels = labels.to(self.device)
 
-
-<< << << < HEAD
                     with amp.autocast(self.device.type):
-== == == =
-                    with amp.autocast():
->>>>>> > d141a88(build the initial framework based on YOLOv6)
                         outputs = self.model(images)
                         # loss = self.compute_loss(outputs, labels)
 
@@ -234,12 +244,15 @@ class Trainer:
                               self.loss_items) / (self.step + 1)
             self.pbar.set_description(('%10s' + ' %10.4g' + '%10.4g')
                                       % (f'{self.epoch}/{self.max_epoch - 1}',
-                                         self.scheduler.get_last_lr()[0], self.mean_loss))
+                                         self.optimizer.param_groups[0]['lr'], self.mean_loss))
 
     def print_infor(self):
         if self.main_process:
             LOGGER.info(
                 f'\nTraining completed in {(time.time() - self.start_time) / 3600:.3f} hours.')
+            LOGGER.info(
+                f'the best accuracy of {self.args.model} is: {self.best_acc:.3f}%.'
+            )
 
     # Empty cache if training finished
     def train_after_loop(self):
@@ -294,7 +307,9 @@ class Trainer:
         accumulate = max(1, round(base_batch_size / args.batch_size))
         weight_decay *= args.batch_size * accumulate / base_batch_size
         # 根据实时的batch size对lr0进行缩放
-        lr0 = args.lr0 * (args.batch_size / base_batch_size)
+        self.lr0 = args.lr0 * (args.batch_size / base_batch_size)
+        self.warmup_steps = int(
+            self.warmup_steps * (base_batch_size / args.batch_size))
 
         # 单独对非bn的weight施加正则化
         g_bnw, g_w, g_b = [], [], []
@@ -307,7 +322,7 @@ class Trainer:
                 g_w.append(v.weight)
         # SGD
         optimizer = torch.optim.SGD(
-            g_bnw, lr=lr0, momentum=momentum, nesterov=True)
+            g_bnw, lr=self.lr0, momentum=momentum, nesterov=True)
         optimizer.add_param_group(
             {'params': g_w, 'weight_decay': weight_decay})
         optimizer.add_param_group({'params': g_b})
